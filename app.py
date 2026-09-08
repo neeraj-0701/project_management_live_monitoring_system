@@ -1,27 +1,31 @@
 """
 R&D Lab Management Dashboard
 =============================
-Reads the "Project_Management" Excel workbook and renders an interactive
-Streamlit dashboard covering Materials & Inventory, HR tasks, Casting &
-Testing activity, Flow/Compression/Flexural test logs, Budget and SCM
-purchasing.
+Reads live data from a Google Sheet (same tab layout as the original
+"Project_Management" workbook) and renders an interactive Streamlit
+dashboard covering Materials & Inventory, HR tasks, Casting & Testing
+activity, Flow/Compression/Flexural test logs, Budget and SCM purchasing.
 
 Run with:
-    pip install streamlit pandas openpyxl plotly
+    pip install streamlit pandas plotly gspread google-auth
     streamlit run app.py
 
-By default it looks for "Project_Management__1_.xlsx" in the same folder.
-You can also upload a different (or updated) copy of the workbook from the
-sidebar without touching the code.
+Requires a Google service account with access to the target Google Sheet,
+configured via Streamlit secrets. See README.md for setup steps. A local
+.xlsx upload fallback is also available from the sidebar for offline testing.
 """
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import gspread
+from google.oauth2.service_account import Credentials
 
 st.set_page_config(page_title="R&D Lab Dashboard", layout="wide", page_icon="🧪")
 
 DEFAULT_FILE = "Project_Management__1_.xlsx"
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly",
+          "https://www.googleapis.com/auth/drive.readonly"]
 
 # ----------------------------------------------------------------------
 # Generic helpers
@@ -51,6 +55,47 @@ def load_sheet(xls: pd.ExcelFile, sheet_name: str, marker: str) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+def _clean_from_raw(raw: pd.DataFrame, marker: str) -> pd.DataFrame:
+    """Shared cleanup: find header row, promote it, drop empty rows/cols
+    and stray Unnamed columns. Used by both Excel and Google Sheets paths."""
+    header_row = find_header_row(raw, marker)
+    header = raw.iloc[header_row]
+    df = raw.iloc[header_row + 1:].copy()
+    df.columns = header
+    df = df.dropna(axis=1, how="all")
+    df = df.dropna(axis=0, how="all")
+    df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed")]
+    df = df.loc[:, df.columns.notna()]
+    return df.reset_index(drop=True)
+
+
+@st.cache_resource(show_spinner=False)
+def get_gspread_client():
+    """Authorize a gspread client from Streamlit secrets. Returns None if
+    the required secrets aren't configured (falls back to file upload)."""
+    if "gcp_service_account" not in st.secrets:
+        return None
+    creds = Credentials.from_service_account_info(
+        dict(st.secrets["gcp_service_account"]), scopes=SCOPES
+    )
+    return gspread.authorize(creds)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_gsheet_tab(_client, sheet_id: str, tab_name: str, marker: str) -> pd.DataFrame:
+    """Pull one worksheet tab from a Google Sheet and clean it the same way
+    as an Excel sheet. Cached for 60s so the app stays fast but still fresh
+    for daily data entry."""
+    sh = _client.open_by_key(sheet_id)
+    ws = sh.worksheet(tab_name)
+    values = ws.get_all_values()
+    if not values:
+        return pd.DataFrame()
+    raw = pd.DataFrame(values)
+    raw = raw.replace("", pd.NA)
+    return _clean_from_raw(raw, marker)
+
+
 def has_data(df: pd.DataFrame, min_rows: int = 1) -> bool:
     return df is not None and not df.empty and len(df) >= min_rows
 
@@ -64,36 +109,70 @@ def empty_notice(section: str):
 
 
 # ----------------------------------------------------------------------
-# Sidebar: file source
+# Sidebar: data source (Google Sheet is primary; Excel upload is fallback)
 # ----------------------------------------------------------------------
 
 st.sidebar.title("🧪 R&D Lab Dashboard")
-uploaded = st.sidebar.file_uploader("Upload workbook (.xlsx)", type=["xlsx"])
-source = uploaded if uploaded is not None else DEFAULT_FILE
 
-try:
-    xls = pd.ExcelFile(source)
-except FileNotFoundError:
-    st.error(
-        f"Could not find '{DEFAULT_FILE}'. Place it next to app.py, "
-        "or upload a workbook using the sidebar."
-    )
-    st.stop()
+client = get_gspread_client()
+SHEET_TABS = {
+    "materials": ("Materials & Inventory", "S.No"),
+    "hr": ("Human Resources ", "S.No"),
+    "casting": ("Casting and Testing Activity", "S.No"),
+    "flow": ("Flow Table Test ", "S.No"),
+    "compression": ("Compression Test ", "S.No"),
+    "flexural": ("Flexural  Test ", "S.No"),
+    "budget": ("Budget", "Cost Head"),
+    "scm": ("SCM", "S.No"),
+}
+data = {}
 
-st.sidebar.caption("Data source: " + (uploaded.name if uploaded else DEFAULT_FILE))
+if client is not None:
+    sheet_id = st.secrets.get("gsheet_id")
+    if not sheet_id:
+        st.error("Google credentials found but 'gsheet_id' is missing from secrets. Add it in your Streamlit secrets.")
+        st.stop()
+    if st.sidebar.button("🔄 Refresh now"):
+        st.cache_data.clear()
+    st.sidebar.success("Live data source: Google Sheets")
+    st.sidebar.caption("Auto-refreshes every 60s, or click Refresh now.")
+    try:
+        for key, (tab_name, marker) in SHEET_TABS.items():
+            data[key] = load_gsheet_tab(client, sheet_id, tab_name, marker)
+    except gspread.exceptions.WorksheetNotFound as e:
+        st.error(f"Tab not found in the Google Sheet: {e}. Check tab names match the original workbook exactly.")
+        st.stop()
+    except gspread.exceptions.APIError as e:
+        st.error(f"Google Sheets API error: {e}. Confirm the sheet is shared with the service account email.")
+        st.stop()
+else:
+    st.sidebar.info("No Google Sheets connection configured — using file upload instead.")
+    uploaded = st.sidebar.file_uploader("Upload workbook (.xlsx)", type=["xlsx"])
+    source = uploaded if uploaded is not None else DEFAULT_FILE
+    try:
+        xls = pd.ExcelFile(source)
+    except FileNotFoundError:
+        st.error(
+            f"Could not find '{DEFAULT_FILE}'. Place it next to app.py, "
+            "or upload a workbook using the sidebar."
+        )
+        st.stop()
+    st.sidebar.caption("Data source: " + (uploaded.name if uploaded else DEFAULT_FILE))
+    for key, (tab_name, marker) in SHEET_TABS.items():
+        data[key] = load_sheet(xls, tab_name, marker) if tab_name in xls.sheet_names else pd.DataFrame()
 
 # ----------------------------------------------------------------------
-# Load each sheet (resilient to sparse/template data)
+# Unpack loaded sheets (resilient to sparse/template data)
 # ----------------------------------------------------------------------
 
-materials = load_sheet(xls, "Materials & Inventory", "S.No") if "Materials & Inventory" in xls.sheet_names else pd.DataFrame()
-hr = load_sheet(xls, "Human Resources ", "S.No") if "Human Resources " in xls.sheet_names else pd.DataFrame()
-casting = load_sheet(xls, "Casting and Testing Activity", "S.No") if "Casting and Testing Activity" in xls.sheet_names else pd.DataFrame()
-flow = load_sheet(xls, "Flow Table Test ", "S.No") if "Flow Table Test " in xls.sheet_names else pd.DataFrame()
-compression = load_sheet(xls, "Compression Test ", "S.No") if "Compression Test " in xls.sheet_names else pd.DataFrame()
-flexural = load_sheet(xls, "Flexural  Test ", "S.No") if "Flexural  Test " in xls.sheet_names else pd.DataFrame()
-budget = load_sheet(xls, "Budget", "Cost Head") if "Budget" in xls.sheet_names else pd.DataFrame()
-scm = load_sheet(xls, "SCM", "S.No") if "SCM" in xls.sheet_names else pd.DataFrame()
+materials = data["materials"]
+hr = data["hr"]
+casting = data["casting"]
+flow = data["flow"]
+compression = data["compression"]
+flexural = data["flexural"]
+budget = data["budget"]
+scm = data["scm"]
 
 # Drop rows that only have an S.No / Date but nothing else meaningful
 def drop_blank_records(df, key_cols):
